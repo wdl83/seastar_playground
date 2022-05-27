@@ -33,7 +33,7 @@ BUILD=release  make -f file_xread.Makefile
 ./obj_release/file_xread.elf  --input 64x4K --n 8 --shards 4
 ```
 
-## sharded_file_xread.cpp (parallel file read)
+## sharded_file_xread.cpp (concurfent file read - via multiple threads)
 
 ```console
 # release build
