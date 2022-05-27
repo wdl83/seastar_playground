@@ -11,6 +11,9 @@
 
 #include <libgen.h>
 #include <unistd.h>
+
+#define ENSURE(cond) assert((cond))
+
 namespace trace {
 
 using Clock = std::chrono::steady_clock;

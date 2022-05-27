@@ -10,13 +10,13 @@ CXXFLAGS = \
 	-Wno-unused-parameter \
 	-Wunreachable-code \
 	-g \
-	-std=c++20
+	-std=c++20 \
+	-DTRACE_ENABLED
 
 LDFLAGS = \
 	-lstdc++
 
-ifdef DEBUG
-	CXXFLAGS += -DTRACE_ENABLED 
+ifdef SANITIZE
 	CXXFLAGS += -fsanitize=address
 	CXXFLAGS += -fsanitize=undefined
 	LDFLAGS += -fsanitize=address

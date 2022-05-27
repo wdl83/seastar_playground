@@ -1,0 +1,13 @@
+SEASTAR = ./seastar
+
+ifndef BUILD
+$(error please define BUILD type: release/dev/debug)
+endif
+
+SEASTAR_CXXFLAGS = `pkg-config --cflags $(SEASTAR)/build/$(BUILD)/seastar.pc`
+SEASTAR_LDFLAGS = `pkg-config --libs --static $(SEASTAR)/build/$(BUILD)/seastar.pc`
+
+CXXFLAGS += $(SEASTAR_CXXFLAGS)
+LDFLAGS += $(SEASTAR_LDFLAGS)
+
+CXXSRCS += seastar_sink.cpp

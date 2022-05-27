@@ -16,8 +16,6 @@ namespace trace {
 std::unique_ptr<trace::Sink> makeSink() {return std::make_unique<trace::COutSink>();}
 } // trace
 
-#define ENSURE(cond) assert((cond))
-
 using IOMode = std::ios_base;
 using Position = std::fstream::pos_type;
 using Block = std::vector<char>;
