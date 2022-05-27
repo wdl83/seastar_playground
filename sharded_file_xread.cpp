@@ -63,6 +63,7 @@ struct Loader
         name{std::move(name)},
         seq(seastar::smp::count)
     {
+        ENSURE(int(seastar::smp::count) >= n);
         int i{0};
         while(i != n) {seq[i] = {offset, stride}; offset += stride; ++i;}
     }
@@ -110,6 +111,7 @@ seastar::future<> file_xread(std::string name, int n, const int p)
 
 seastar::future<> file_xread_mr(std::string name, int n, const int p)
 {
+    ENSURE(int(seastar::smp::count) >= p);
     const size_t blkSize{4096};
     const auto size = co_await fileSize(name);
     auto xSize = (size / n) & ~(blkSize - 1);
