@@ -139,12 +139,17 @@ struct LogScope
             - static_cast<const char *>(prev);
 
         if(0 > diff) diff = 0;
-        if(16 * 1024 > diff) diff = 0;
+        if(16 * 1024 < diff) diff = 0;
 
         Log::instance().log({this, diff}, depth(), dbg, "{ ", tail...);
         ++depth();
         addr() = this;
     }
+
+    LogScope(const LogScope &) = delete;
+    LogScope(LogScope &&) = delete;
+    LogScope &operator=(const LogScope &) = delete;
+    LogScope &operator=(LogScope &&) = delete;
 
     ~LogScope()
     {
