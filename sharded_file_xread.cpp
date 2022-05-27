@@ -75,6 +75,8 @@ struct Loader
 
 seastar::future<> file_xread(std::string name, int n, const int p)
 {
+    ENSURE(0 < p);
+    ENSURE(int(seastar::smp::count) >= p);
     const size_t blkSize{4096};
     const auto size = co_await fileSize(name);
     auto xSize = (size / n) & ~(blkSize - 1);
@@ -111,6 +113,7 @@ seastar::future<> file_xread(std::string name, int n, const int p)
 
 seastar::future<> file_xread_mr(std::string name, int n, const int p)
 {
+    ENSURE(0 < p);
     ENSURE(int(seastar::smp::count) >= p);
     const size_t blkSize{4096};
     const auto size = co_await fileSize(name);
