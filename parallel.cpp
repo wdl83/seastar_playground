@@ -190,12 +190,6 @@ ChunkSeq split(Size fileSize, size_t maxChunkSize)
     return seq;
 }
 
-struct Sorted
-{
-    BlockSeq seq;
-    Position position{0};
-};
-
 /* sort single chunk data (load + sort + store) */
 seastar::future<> sortChunk(
     seastar::file inFile,
