@@ -16,6 +16,7 @@
 #include "trace.h"
 
 #define ENSURE_ALIGNED(value, alignment) ENSURE(0 == ((value) & ((alignment) - 1)))
+//#define ENSURE_ALIGNED(value, alignment)
 
 using Block = std::vector<char>;
 using BlockSeq = std::vector<Block>;
