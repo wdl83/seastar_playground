@@ -97,7 +97,7 @@ seastar::future<> file_xread(std::string name, int n, const int p)
             [](Loader &local) -> seastar::future<>
             {
                 ENSURE(local.seq.size() == seastar::smp::count);
-                auto info = local.seq[seastar::smp::count - 1];
+                auto info = local.seq[seastar::this_shard_id()];
                 if(0 == info.size) co_return;
                 co_await load(local.name, info.offset, info.size);
                 co_return;
