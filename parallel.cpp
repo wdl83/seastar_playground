@@ -44,10 +44,10 @@ std::ostream &operator<<(std::ostream &os, const Chunk &chunk)
 }
 
 template <typename I, typename CI, typename D>
-I successor(I i, D n, const CI end)
+I successor(I begin, const CI end, D n)
 {
-    while(0 < n && i != end){--n; ++i;}
-    return i;
+    while(D{0} < n && begin != end){--n; ++begin;}
+    return begin;
 }
 
 struct BlockInfo
@@ -241,7 +241,7 @@ seastar::future<> sortChunks(
     {
         seastar::sharded<Sorter> sorter;
 
-        auto next = successor(begin, seastar::smp::count, end);
+        auto next = successor(begin, end, seastar::smp::count);
         co_await sorter.start(begin, next);
 
         auto exec =
@@ -349,7 +349,11 @@ seastar::future<> merge(
 
         while(begin != end)
         {
-            const auto next = successor(begin, maxChunkNum, end);
+            const auto next =
+                successor(
+                    begin, end,
+                    std::min(size_t(seastar::smp::count), maxChunkNum));
+
             const auto offset = (begin->position + stride) % stride2x;
 
             TRACE("srcOffset: ", begin->position, ", dstOffset: ", offset);
