@@ -190,16 +190,14 @@ struct Sorted
 };
 
 /* sort single chunk data (load + sort + store) */
-seastar::future<Sorted> sortChunk(
-    std::string inName,
+seastar::future<> sortChunk(
+    seastar::file inFile, seastar::file outFile,
     const Chunk &chunk, size_t blockSize)
 {
-    auto file = co_await seastar::open_file_dma(inName, IOFlags::ro);
-    auto seq = co_await loadBlockSeq(file, blockSize, chunk.size, chunk.position);
+    auto seq = co_await loadBlockSeq(inFile, blockSize, chunk.size, chunk.position);
 
     std::sort(std::begin(seq), std::end(seq));
-    co_await file.close();
-    co_return Sorted{std::move(seq), chunk.position};
+    co_await storeBlockSeq(outFile, seq, chunk.position);
 }
 
 struct Sorter
@@ -231,6 +229,7 @@ seastar::future<> sortChunks(
     ENSURE(!seq.empty());
     TRACE_SCOPE("chunkSeq: ", seq.size());
 
+    auto inFile = co_await seastar::open_file_dma(inName, IOFlags::ro);
     auto outFile =
          co_await seastar::open_file_dma(
              outName, IOFlags::create | IOFlags::rw | IOFlags::truncate);
@@ -245,33 +244,29 @@ seastar::future<> sortChunks(
         auto next = successor(begin, seastar::smp::count, end);
         co_await sorter.start(begin, next);
 
-        auto reducer =
-            [&outFile](auto sorted) -> seastar::future<>
-            {
-                co_await storeBlockSeq(outFile, sorted.seq, sorted.position);
-                co_return;
-            };
-
         auto exec =
             [](
                 Sorter &sorter,
-                std::string inName, size_t blockSize) -> seastar::future<Sorted>
+                seastar::file_handle inHandle, seastar::file_handle outHandle,
+                size_t blockSize)
+            -> seastar::future<>
             {
                 auto chunk = sorter.chunks[seastar::this_shard_id()];
-                if(!chunk) co_return Sorted{};
-                auto sorted = co_await sortChunk(inName, *chunk, blockSize);
-                co_return sorted;
+                if(!chunk) co_return;
+                co_await sortChunk(inHandle.to_file(), outHandle.to_file(), *chunk, blockSize);
+                co_return;
             };
 
         co_await
-            sorter.map_reduce(
-                std::move(reducer), std::move(exec),
-                std::string{inName}, size_t{blockSize});
+            sorter.invoke_on_all(
+                std::move(exec),
+                inFile.dup(), outFile.dup(), size_t{blockSize});
 
         co_await sorter.stop();
         begin = next;
     }
 
+    co_await inFile.close();
     co_await outFile.flush();
     co_await outFile.close();
     co_return;
