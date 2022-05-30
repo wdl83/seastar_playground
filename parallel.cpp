@@ -306,18 +306,15 @@ seastar::future<> pushBlock(
 }
 
 seastar::future<size_t> nWayMerge(
-    seastar::file file,
+    std::string fileName,
     ChunkSeq::iterator begin, ChunkSeq::const_iterator end,
     const size_t blockSize,
     Position dstOffset)
 {
     BlockQueue queue;
+    auto file = co_await seastar::open_file_dma(fileName, IOFlags::rw);
 
-    for(auto i = begin; end != i; ++i)
-    {
-        //TRACE("position: ", i->position, ", size: ", i->size, ", dst: ", dstOffset);
-        co_await pushBlock(file, *i, blockSize, queue);
-    }
+    for(auto i = begin; end != i; ++i) co_await pushBlock(file, *i, blockSize, queue);
 
     size_t size{0};
 
@@ -331,6 +328,9 @@ seastar::future<size_t> nWayMerge(
          co_await pushBlock(file, *blockInfo.chunk, blockSize, queue);
          queue.pop();
     }
+
+    co_await file.flush();
+    co_await file.close();
     co_return size;
 }
 
@@ -364,6 +364,31 @@ struct Merger
     }
     seastar::future<> stop() {return seastar::make_ready_future<>();}
 };
+
+seastar::future<> truncateOutFile(
+    Size inFileSize, std::string name, size_t chunkSize, bool shift)
+{
+    auto file = co_await seastar::open_file_dma(name, IOFlags::rw);
+
+    if(shift)
+    {
+        TRACE("shift data");
+        std::vector<char> buf(chunkSize);
+        Position size{0};
+
+        while(inFileSize != size)
+        {
+            const auto bufSize = std::min(Position(inFileSize - size), Position(buf.size()));
+            co_await file.dma_read(size + inFileSize, buf.data(), bufSize);
+            co_await file.dma_write(size, buf.data(), bufSize);
+            size += bufSize;
+        }
+    }
+
+    co_await file.truncate(inFileSize);
+    co_await file.flush();
+    co_await file.close();
+}
 
 seastar::future<> merge(
     const Size inFileSize,
@@ -419,19 +444,14 @@ seastar::future<> merge(
                     TRACE(
                         "src/dst offset: ", range.begin->position, "/", offset,
                         ", chunks: ", range.length);
-
                     //dump(range->begin, range->end);
-
-                    auto file = co_await seastar::open_file_dma(fileName, IOFlags::rw);
 
                     const auto size =
                         co_await nWayMerge(
-                            file, range.begin, range.end, blockSize, offset);
+                            fileName, range.begin, range.end, blockSize, offset);
 
                     range.begin->position = offset;
                     range.begin->size = size;
-                    co_await file.flush();
-                    co_await file.close();
                     co_return std::move(range);
                 };
 
@@ -444,30 +464,7 @@ seastar::future<> merge(
     }
 
     ENSURE(1 == seq.size());
-
-    TRACE("result: position: ", seq.front().position, ", size: ", seq.front().size);
-
-    auto file = co_await seastar::open_file_dma(fileName, IOFlags::rw);
-
-    if(0 != seq.front().position)
-    {
-        TRACE("copy right-to-left");
-
-        std::vector<char> buf(chunkSize);
-        Position size{0};
-
-        while(inFileSize != size)
-        {
-            const auto bufSize = std::min(Position(inFileSize - size), Position(buf.size()));
-            co_await file.dma_read(size + inFileSize, buf.data(), bufSize);
-            co_await file.dma_write(size, buf.data(), bufSize);
-            size += bufSize;
-        }
-    }
-
-    co_await file.truncate(inFileSize);
-    co_await file.flush();
-    co_await file.close();
+    co_await truncateOutFile(inFileSize, fileName, chunkSize, 0 != seq.front().position);
     co_return;
 }
 /*----------------------------------------------------------------------------*/
