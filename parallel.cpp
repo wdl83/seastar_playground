@@ -43,8 +43,8 @@ std::ostream &operator<<(std::ostream &os, const Chunk &chunk)
     return os;
 }
 
-template <typename I, typename D>
-I successor(I i, D n, const I end)
+template <typename I, typename CI, typename D>
+I successor(I i, D n, const CI end)
 {
     while(0 < n && i != end){--n; ++i;}
     return i;
@@ -347,13 +347,14 @@ seastar::future<> merge(
         /* max number of chunks we are able to process with chunkSize limit */
         const auto maxChunkNum = std::min(maxBlockNum, seq.size());
         auto begin = std::begin(seq);
+        auto end = std::cend(seq);
 
         TRACE("seqSize: ", seq.size(), ", stride: ", stride);
-        dump(begin, std::end(seq));
+        dump(begin, end);
 
-        while(begin != std::end(seq))
+        while(begin != end)
         {
-            const auto next = successor(begin, maxChunkNum, std::end(seq));
+            const auto next = successor(begin, maxChunkNum, end);
             const auto offset = (begin->position + stride) % stride2x;
 
             TRACE("srcOffset: ", begin->position, ", dstOffset: ", offset);
