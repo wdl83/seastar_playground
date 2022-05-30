@@ -123,7 +123,7 @@ seastar::future<BlockSeq> loadBlockSeq(
     ENSURE(0 == seqSize % blockSize);
     size_t num = seqSize / blockSize;
 
-    TRACE_SCOPE("position: ", position, ", num: ", num, ", seqSize: ", seqSize);
+    //TRACE_SCOPE("position: ", position, ", num: ", num, ", seqSize: ", seqSize);
 
     BlockSeq seq(num, Block(blockSize));
     auto offset = position;
@@ -159,7 +159,7 @@ seastar::future<> storeBlockSeq(
     seastar::file file, const BlockSeq &seq, const Position position)
 {
     ENSURE(file);
-    TRACE_SCOPE("position: ", position, ", num: ", seq.size());
+    //TRACE_SCOPE("position: ", position, ", num: ", seq.size());
 
     auto offset = position;
 
@@ -201,11 +201,9 @@ seastar::future<> sortChunk(
     std::string outName,
     const Chunk &chunk, size_t blockSize)
 {
-    TRACE_SCOPE("");
     auto seq = co_await loadBlockSeq(inFile, blockSize, chunk.size, chunk.position);
     std::sort(std::begin(seq), std::end(seq));
     auto outFile = co_await seastar::open_file_dma(outName, IOFlags::wo);
-    TRACE("fSize: ", co_await outFile.size());
     co_await storeBlockSeq(outFile, seq, chunk.position);
     co_await outFile.flush();
     co_await outFile.close();
@@ -242,11 +240,13 @@ seastar::future<> sortChunks(
     auto inFile = co_await seastar::open_file_dma(inName, IOFlags::ro);
 
     {
-        Block blank(blockSize, '?');
         auto outFile =
             co_await
                 seastar::open_file_dma(
                     outName, IOFlags::create | IOFlags::rw | IOFlags::truncate);
+        /* pre-allocate output file, fill last block to get file size fixed
+         * before concurrent writes */
+        Block blank(outFile.disk_write_dma_alignment(), '?');
         co_await outFile.allocate(0, inFileSize << 1);
         co_await storeBlock(outFile, blank, (inFileSize << 1) - blockSize);
         co_await outFile.flush();
@@ -313,20 +313,16 @@ seastar::future<size_t> nWayMerge(
 
     for(auto i = begin; end != i; ++i)
     {
-        TRACE("position: ", i->position, ", size: ", i->size, ", dst: ", dstOffset);
+        //TRACE("position: ", i->position, ", size: ", i->size, ", dst: ", dstOffset);
         co_await pushBlock(file, *i, blockSize, queue);
     }
 
     size_t size{0};
 
-    for(;;)
+    while(!queue.empty())
     {
-         if(queue.empty()) break;
-
          const auto &blockInfo = queue.top();
-
          co_await storeBlock(file, blockInfo.block, dstOffset);
-
          dstOffset += blockSize;
          size += blockSize;
          ENSURE(blockInfo.chunk);
@@ -342,8 +338,9 @@ struct Merger
     {
         ChunkSeq::iterator begin;
         ChunkSeq::iterator end;
+        size_t length{0};
     };
-    std::vector<std::unique_ptr<Range>> ranges;
+    std::vector<Range> ranges;
 
     Merger(
         ChunkSeq::iterator begin, ChunkSeq::const_iterator const end,
@@ -357,7 +354,9 @@ struct Merger
             auto next = begin;
             auto i{0u};
             while(next != end && maxChunkNum > i) {++next; ++i;}
-            range = std::make_unique<Range>(begin, next);
+            range.begin = begin;
+            range.end = next;
+            range.length = i;
             begin = next;
         }
     }
@@ -388,7 +387,7 @@ seastar::future<> merge(
         auto end = std::cend(seq);
 
         TRACE("seqSize: ", seq.size(), ", stride: ", stride, ", maxChunkNum: ", maxChunkNum);
-        dump(begin, end);
+        //dump(begin, end);
 
         while(begin != end)
         {
@@ -398,11 +397,10 @@ seastar::future<> merge(
             begin = next;
 
             auto reduce =
-                [&seq](
-                    std::unique_ptr<Merger::Range> range) -> seastar::future<>
+                [&seq](Merger::Range range) -> seastar::future<>
                 {
-                    if(!range) co_return;
-                    seq.erase(std::next(range->begin), range->end);
+                    if(0 == range.length) co_return;
+                    seq.erase(std::next(range.begin), range.end);
                 };
 
             auto exec =
@@ -410,26 +408,26 @@ seastar::future<> merge(
                     Merger &merger,
                     std::string fileName,
                     size_t stride, size_t blockSize)
-                -> seastar::future<std::unique_ptr<Merger::Range>>
+                -> seastar::future<Merger::Range>
                 {
-                    auto &range = merger.ranges[seastar::this_shard_id()];
-                    if(!range) co_return nullptr;
-                    const auto offset = (range->begin->position + stride) % (stride << 1);
+                    auto range = merger.ranges[seastar::this_shard_id()];
+                    if(size_t{0} == range.length) co_return range;
+                    const auto offset = (range.begin->position + stride) % (stride << 1);
 
                     TRACE(
-                        "srcOffset: ", range->begin->position,
-                        ", dstOffset: ", offset);
+                        "src/dst offset: ", range.begin->position, "/", offset,
+                        ", chunks: ", range.length);
 
-                    dump(range->begin, range->end);
+                    //dump(range->begin, range->end);
 
                     auto file = co_await seastar::open_file_dma(fileName, IOFlags::rw);
 
                     const auto size =
                         co_await nWayMerge(
-                            file, range->begin, range->end, blockSize, offset);
+                            file, range.begin, range.end, blockSize, offset);
 
-                    range->begin->position = offset;
-                    range->begin->size = size;
+                    range.begin->position = offset;
+                    range.begin->size = size;
                     co_await file.flush();
                     co_await file.close();
                     co_return std::move(range);
