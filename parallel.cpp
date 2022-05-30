@@ -227,6 +227,21 @@ struct Sorter
     seastar::future<> stop() {return seastar::make_ready_future<>();}
 };
 
+seastar::future<> createOutFile(Size inFileSize, std::string name)
+{
+    auto outFile =
+        co_await
+            seastar::open_file_dma(
+                name, IOFlags::create | IOFlags::rw | IOFlags::truncate);
+    /* pre-allocate output file, fill last block to get file size fixed
+     * before concurrent writes */
+    Block blank(outFile.disk_write_dma_alignment(), '?');
+    co_await outFile.allocate(0, inFileSize << 1);
+    co_await storeBlock(outFile, blank, (inFileSize << 1) - blank.size());
+    co_await outFile.flush();
+    co_await outFile.close();
+}
+
 /* sort sequence of chunks */
 seastar::future<> sortChunks(
     std::string inName, Size inFileSize, std::string outName,
@@ -238,20 +253,7 @@ seastar::future<> sortChunks(
     TRACE_SCOPE("chunkSeq: ", seq.size());
 
     auto inFile = co_await seastar::open_file_dma(inName, IOFlags::ro);
-
-    {
-        auto outFile =
-            co_await
-                seastar::open_file_dma(
-                    outName, IOFlags::create | IOFlags::rw | IOFlags::truncate);
-        /* pre-allocate output file, fill last block to get file size fixed
-         * before concurrent writes */
-        Block blank(outFile.disk_write_dma_alignment(), '?');
-        co_await outFile.allocate(0, inFileSize << 1);
-        co_await storeBlock(outFile, blank, (inFileSize << 1) - blank.size());
-        co_await outFile.flush();
-        co_await outFile.close();
-    }
+    co_await createOutFile(inFileSize, outName);
 
     const auto end = std::end(seq);
     auto begin = std::begin(seq);
