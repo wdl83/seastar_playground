@@ -33,7 +33,7 @@ BUILD=release  make -f file_xread.Makefile
 ./obj_release/file_xread.elf  --input 64x4K --n 8 --shards 4
 ```
 
-## sharded_file_xread.cpp (concurfent file read - via multiple threads)
+## sharded_file_xread.cpp (concurrent file read - via multiple threads)
 
 ```console
 # release build
@@ -42,6 +42,14 @@ BUILD=release  make -f sharded_file_xread.Makefile
 ./obj_release/sharded_file_xread.elf  --input 64x4K --n 8 --shards 4 --mr 1
 # run with invoke_on_all
 ./obj_release/sharded_file_xread.elf  --input 64x4K --n 8 --shards 4 --mr 0
+```
+
+## parallel.cpp - concurrent lexicographical order block sorting
+```console
+# release build with traces
+BUILD=release make -f parallel.Makefile
+# run (sort 16MB file with 4K blocks and use max. 64K cache per shard)
+./obj_release/parallel.elf  --input 16Mx4K --output p16Mx4K --block 4096 --chunk 65536
 ```
 
 ## Generating random text files (aligned to specified boundary)
