@@ -463,15 +463,9 @@ seastar::future<> merge(
     co_return;
 }
 /*----------------------------------------------------------------------------*/
-void help(const char *message = nullptr)
-{
-    if(message) std::cout << "WARNING: " << message << "\n";
-    std::cout << " -i filename" " -o filename" " -m max_size/shard" " -b block_size\n";
-}
-
 int error(const char *reason)
 {
-    help(reason);
+    if(reason) std::cout << "WARNING: " << reason << "\n";
     return EXIT_FAILURE;
 }
 
