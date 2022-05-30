@@ -248,7 +248,7 @@ seastar::future<> sortChunks(
          * before concurrent writes */
         Block blank(outFile.disk_write_dma_alignment(), '?');
         co_await outFile.allocate(0, inFileSize << 1);
-        co_await storeBlock(outFile, blank, (inFileSize << 1) - blockSize);
+        co_await storeBlock(outFile, blank, (inFileSize << 1) - blank.size());
         co_await outFile.flush();
         co_await outFile.close();
     }
