@@ -27,10 +27,13 @@ using IOFlags = seastar::open_flags;
 
 struct Chunk
 {
-    Position position;
-    size_t size;
+    Position position{0};
+    size_t size{0};
 
-    explicit Chunk(Position position, size_t size): position{position}, size{size}
+    Chunk()
+    {}
+    explicit Chunk(Position position, size_t size):
+        position{position}, size{size}
     {}
 };
 
@@ -93,6 +96,7 @@ seastar::future<> loadBlock(
     ENSURE(file);
     ENSURE(block.size());
     ENSURE_ALIGNED(block.size(), file.disk_read_dma_alignment());
+    ENSURE_ALIGNED(uintptr_t(block.data()), file.disk_read_dma_alignment());
     size_t size{0};
 
     while(block.size() != size)
@@ -138,6 +142,8 @@ seastar::future<> storeBlock(
     ENSURE(file);
     ENSURE(block.size());
     ENSURE_ALIGNED(block.size(), file.disk_write_dma_alignment());
+    ENSURE_ALIGNED(uintptr_t(block.data()), file.disk_write_dma_alignment());
+
     try
     {
         co_await file.dma_write(position, block.data(), block.size());
@@ -190,28 +196,34 @@ struct Sorted
 };
 
 /* sort single chunk data (load + sort + store) */
-seastar::future<Sorted> sortChunk(
-    seastar::file file, const Chunk &chunk, size_t blockSize)
+seastar::future<> sortChunk(
+    seastar::file inFile,
+    std::string outName,
+    const Chunk &chunk, size_t blockSize)
 {
-    auto seq = co_await loadBlockSeq(file, blockSize, chunk.size, chunk.position);
+    TRACE_SCOPE("");
+    auto seq = co_await loadBlockSeq(inFile, blockSize, chunk.size, chunk.position);
     std::sort(std::begin(seq), std::end(seq));
-    co_return Sorted{std::move(seq), chunk.position};
+    auto outFile = co_await seastar::open_file_dma(outName, IOFlags::wo);
+    TRACE("fSize: ", co_await outFile.size());
+    co_await storeBlockSeq(outFile, seq, chunk.position);
+    co_await outFile.flush();
+    co_await outFile.close();
+    co_return;
 }
 
 struct Sorter
 {
-    std::vector<const Chunk *> chunks;
+    std::vector<Chunk> chunks;
 
     Sorter(
         ChunkSeq::const_iterator begin, ChunkSeq::const_iterator end):
-        chunks(seastar::smp::count, nullptr)
+        chunks(seastar::smp::count)
     {
         auto i{0u};
         while(begin != end && seastar::smp::count > i)
         {
-            chunks[i] = &(*begin);
-            ++begin;
-            ++i;
+            chunks[i] = *begin; ++begin; ++i;
         }
     }
     seastar::future<> stop() {return seastar::make_ready_future<>();}
@@ -228,10 +240,18 @@ seastar::future<> sortChunks(
     TRACE_SCOPE("chunkSeq: ", seq.size());
 
     auto inFile = co_await seastar::open_file_dma(inName, IOFlags::ro);
-    auto outFile =
-         co_await seastar::open_file_dma(
-             outName, IOFlags::create | IOFlags::rw | IOFlags::truncate);
-    co_await outFile.allocate(0, inFileSize << 1);
+
+    {
+        Block blank(blockSize, '?');
+        auto outFile =
+            co_await
+                seastar::open_file_dma(
+                    outName, IOFlags::create | IOFlags::rw | IOFlags::truncate);
+        co_await outFile.allocate(0, inFileSize << 1);
+        co_await storeBlock(outFile, blank, (inFileSize << 1) - blockSize);
+        co_await outFile.flush();
+        co_await outFile.close();
+    }
 
     const auto end = std::end(seq);
     auto begin = std::begin(seq);
@@ -243,40 +263,29 @@ seastar::future<> sortChunks(
         auto next = successor(begin, end, seastar::smp::count);
         co_await sorter.start(begin, next);
 
-        auto reduce =
-            [&outFile](Sorted sorted) -> seastar::future<>
-            {
-                if(!sorted.seq.empty())
-                {
-                    co_await storeBlockSeq(outFile, sorted.seq, sorted.position);
-                }
-                co_return;
-            };
-
         auto exec =
-            [](Sorter &sorter, seastar::file_handle inHandle, size_t blockSize)
-            -> seastar::future<Sorted>
+            [](
+            Sorter &sorter,
+            seastar::file_handle inHandle, std::string outName,
+            size_t blockSize)
+            -> seastar::future<>
             {
                 auto inFile = inHandle.to_file();
                 auto chunk = sorter.chunks[seastar::this_shard_id()];
-                if(!chunk) co_return Sorted{};
-                auto sorted = co_await sortChunk(inFile, *chunk, blockSize);
+                if(0 == chunk.size) co_return;
+                co_await sortChunk(inFile, outName, chunk, blockSize);
                 co_await inFile.close();
-                co_return sorted;
+                co_return;
             };
 
         co_await
-            sorter.map_reduce(
-                std::move(reduce), std::move(exec),
-                inFile.dup(), size_t{blockSize});
-
+            sorter.invoke_on_all(
+                std::move(exec), inFile.dup(), std::string{outName}, size_t{blockSize});
         co_await sorter.stop();
         begin = next;
     }
 
     co_await inFile.close();
-    co_await outFile.flush();
-    co_await outFile.close();
     co_return;
 }
 
@@ -362,6 +371,7 @@ seastar::future<> merge(
     const size_t chunkSize, const size_t blockSize)
 {
     ENSURE(!seq.empty());
+    ENSURE((inFileSize << 1) == co_await seastar::file_size(fileName));
 
     const auto maxBlockNum = chunkSize / blockSize;
     /* file:
@@ -416,9 +426,7 @@ seastar::future<> merge(
 
                     const auto size =
                         co_await nWayMerge(
-                            file,
-                            range->begin, range->end,
-                            blockSize, offset);
+                            file, range->begin, range->end, blockSize, offset);
 
                     range->begin->position = offset;
                     range->begin->size = size;
@@ -443,7 +451,6 @@ seastar::future<> merge(
 
     if(0 != seq.front().position)
     {
-
         TRACE("copy right-to-left");
 
         std::vector<char> buf(chunkSize);
@@ -466,8 +473,8 @@ seastar::future<> merge(
 /*----------------------------------------------------------------------------*/
 void help(const char *message = nullptr)
 {
-    if(message) TRACE("WARNING: ", message);
-    TRACE(" -i filename" " -o filename" " -m max_size/shard" " -b block_size");
+    if(message) std::cout << "WARNING: " << message << "\n";
+    std::cout << " -i filename" " -o filename" " -m max_size/shard" " -b block_size\n";
 }
 
 int error(const char *reason)

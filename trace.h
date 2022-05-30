@@ -204,6 +204,6 @@ struct COutSink: public Sink
 #else /* TRACE_ENABLED */
 
 #define TRACE(...)
-#define SCOPE_TRACE(...)
+#define TRACE_SCOPE(...)
 
 #endif /* TRACE_ENABLED */
