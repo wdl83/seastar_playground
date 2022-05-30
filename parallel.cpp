@@ -190,14 +190,12 @@ struct Sorted
 };
 
 /* sort single chunk data (load + sort + store) */
-seastar::future<> sortChunk(
-    seastar::file inFile, seastar::file outFile,
-    const Chunk &chunk, size_t blockSize)
+seastar::future<Sorted> sortChunk(
+    seastar::file file, const Chunk &chunk, size_t blockSize)
 {
-    auto seq = co_await loadBlockSeq(inFile, blockSize, chunk.size, chunk.position);
-
+    auto seq = co_await loadBlockSeq(file, blockSize, chunk.size, chunk.position);
     std::sort(std::begin(seq), std::end(seq));
-    co_await storeBlockSeq(outFile, seq, chunk.position);
+    co_return Sorted{std::move(seq), chunk.position};
 }
 
 struct Sorter
@@ -221,7 +219,7 @@ struct Sorter
 
 /* sort sequence of chunks */
 seastar::future<> sortChunks(
-    std::string inName, std::string outName,
+    std::string inName, Size inFileSize, std::string outName,
     const ChunkSeq &seq, size_t blockSize)
 {
     ENSURE(!inName.empty());
@@ -233,6 +231,7 @@ seastar::future<> sortChunks(
     auto outFile =
          co_await seastar::open_file_dma(
              outName, IOFlags::create | IOFlags::rw | IOFlags::truncate);
+    co_await outFile.allocate(0, inFileSize << 1);
 
     const auto end = std::end(seq);
     auto begin = std::begin(seq);
@@ -244,23 +243,32 @@ seastar::future<> sortChunks(
         auto next = successor(begin, end, seastar::smp::count);
         co_await sorter.start(begin, next);
 
-        auto exec =
-            [](
-                Sorter &sorter,
-                seastar::file_handle inHandle, seastar::file_handle outHandle,
-                size_t blockSize)
-            -> seastar::future<>
+        auto reduce =
+            [&outFile](Sorted sorted) -> seastar::future<>
             {
-                auto chunk = sorter.chunks[seastar::this_shard_id()];
-                if(!chunk) co_return;
-                co_await sortChunk(inHandle.to_file(), outHandle.to_file(), *chunk, blockSize);
+                if(!sorted.seq.empty())
+                {
+                    co_await storeBlockSeq(outFile, sorted.seq, sorted.position);
+                }
                 co_return;
             };
 
+        auto exec =
+            [](Sorter &sorter, seastar::file_handle inHandle, size_t blockSize)
+            -> seastar::future<Sorted>
+            {
+                auto inFile = inHandle.to_file();
+                auto chunk = sorter.chunks[seastar::this_shard_id()];
+                if(!chunk) co_return Sorted{};
+                auto sorted = co_await sortChunk(inFile, *chunk, blockSize);
+                co_await inFile.close();
+                co_return sorted;
+            };
+
         co_await
-            sorter.invoke_on_all(
-                std::move(exec),
-                inFile.dup(), outFile.dup(), size_t{blockSize});
+            sorter.map_reduce(
+                std::move(reduce), std::move(exec),
+                inFile.dup(), size_t{blockSize});
 
         co_await sorter.stop();
         begin = next;
@@ -319,8 +327,36 @@ seastar::future<size_t> nWayMerge(
     co_return size;
 }
 
+struct Merger
+{
+    struct Range
+    {
+        ChunkSeq::iterator begin;
+        ChunkSeq::iterator end;
+    };
+    std::vector<std::unique_ptr<Range>> ranges;
+
+    Merger(
+        ChunkSeq::iterator begin, ChunkSeq::const_iterator const end,
+        size_t maxChunkNum):
+        ranges(seastar::smp::count)
+    {
+        for(auto &range : ranges)
+        {
+            if(begin == end) break;
+
+            auto next = begin;
+            auto i{0u};
+            while(next != end && maxChunkNum > i) {++next; ++i;}
+            range = std::make_unique<Range>(begin, next);
+            begin = next;
+        }
+    }
+    seastar::future<> stop() {return seastar::make_ready_future<>();}
+};
+
 seastar::future<> merge(
-    Size inFileSize,
+    const Size inFileSize,
     const std::string &fileName,
     ChunkSeq &seq,
     const size_t chunkSize, const size_t blockSize)
@@ -333,9 +369,6 @@ seastar::future<> merge(
      *      |< ---------   stride   -------->||< ---------   stride   -------->|
      */
     const auto stride{inFileSize};
-    const auto stride2x{stride << 1};
-
-    auto file = co_await seastar::open_file_dma(fileName, IOFlags::rw);
 
     while(1 < seq.size())
     {
@@ -344,29 +377,61 @@ seastar::future<> merge(
         auto begin = std::begin(seq);
         auto end = std::cend(seq);
 
-        TRACE("seqSize: ", seq.size(), ", stride: ", stride);
+        TRACE("seqSize: ", seq.size(), ", stride: ", stride, ", maxChunkNum: ", maxChunkNum);
         dump(begin, end);
 
         while(begin != end)
         {
-            const auto next =
-                successor(
-                    begin, end,
-                    std::min(size_t(seastar::smp::count), maxChunkNum));
-
-            const auto offset = (begin->position + stride) % stride2x;
-
-            TRACE("srcOffset: ", begin->position, ", dstOffset: ", offset);
-
-            dump(begin, next);
-
-            const auto size =
-                co_await nWayMerge(file, begin, next, blockSize, offset);
-
-            begin->position = offset;
-            begin->size = size;
-            seq.erase(std::next(begin), next);
+            seastar::sharded<Merger> merger;
+            const auto next = successor(begin, end, seastar::smp::count * maxChunkNum);
+            co_await merger.start(begin, next, maxChunkNum);
             begin = next;
+
+            auto reduce =
+                [&seq](
+                    std::unique_ptr<Merger::Range> range) -> seastar::future<>
+                {
+                    if(!range) co_return;
+                    seq.erase(std::next(range->begin), range->end);
+                };
+
+            auto exec =
+                [](
+                    Merger &merger,
+                    std::string fileName,
+                    size_t stride, size_t blockSize)
+                -> seastar::future<std::unique_ptr<Merger::Range>>
+                {
+                    auto &range = merger.ranges[seastar::this_shard_id()];
+                    if(!range) co_return nullptr;
+                    const auto offset = (range->begin->position + stride) % (stride << 1);
+
+                    TRACE(
+                        "srcOffset: ", range->begin->position,
+                        ", dstOffset: ", offset);
+
+                    dump(range->begin, range->end);
+
+                    auto file = co_await seastar::open_file_dma(fileName, IOFlags::rw);
+
+                    const auto size =
+                        co_await nWayMerge(
+                            file,
+                            range->begin, range->end,
+                            blockSize, offset);
+
+                    range->begin->position = offset;
+                    range->begin->size = size;
+                    co_await file.flush();
+                    co_await file.close();
+                    co_return std::move(range);
+                };
+
+            co_await
+                merger.map_reduce(
+                    std::move(reduce), std::move(exec),
+                    std::string{fileName}, size_t{stride}, size_t{blockSize});
+            co_await merger.stop();
         }
     }
 
@@ -374,8 +439,11 @@ seastar::future<> merge(
 
     TRACE("result: position: ", seq.front().position, ", size: ", seq.front().size);
 
+    auto file = co_await seastar::open_file_dma(fileName, IOFlags::rw);
+
     if(0 != seq.front().position)
     {
+
         TRACE("copy right-to-left");
 
         std::vector<char> buf(chunkSize);
@@ -389,6 +457,7 @@ seastar::future<> merge(
             size += bufSize;
         }
     }
+
     co_await file.truncate(inFileSize);
     co_await file.flush();
     co_await file.close();
@@ -446,7 +515,7 @@ int main(int argc, char* argv[])
             }
 
             auto seq = split(inFileSize, chunkSize);
-            co_await sortChunks(inName, outName, seq, blockSize);
+            co_await sortChunks(inName, inFileSize, outName, seq, blockSize);
             co_await merge(inFileSize, outName, seq, chunkSize, blockSize);
             co_return EXIT_SUCCESS;
         });
