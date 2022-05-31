@@ -404,7 +404,7 @@ seastar::future<> merge(
     while(1 < seq.size())
     {
         /* max number of chunks we are able to process with chunkSize limit */
-        const auto maxChunkNum = std::min(maxBlockNum, seq.size());
+        const auto maxChunkNum = std::max(size_t(2), std::min(maxBlockNum, seq.size()) / size_t(seastar::smp::count));
         auto begin = std::begin(seq);
         auto end = std::cend(seq);
 
