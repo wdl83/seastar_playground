@@ -30,11 +30,12 @@ struct Chunk
 {
     Position position{0};
     size_t size{0};
+    size_t no{0};
 
     Chunk()
     {}
-    explicit Chunk(Position position, size_t size):
-        position{position}, size{size}
+    explicit Chunk(Position position, size_t size, size_t no):
+        position{position}, size{size}, no{no}
     {}
 };
 
@@ -127,12 +128,36 @@ seastar::future<BlockSeq> loadBlockSeq(
     //TRACE_SCOPE("position: ", position, ", num: ", num, ", seqSize: ", seqSize);
 
     BlockSeq seq(num, Block(blockSize));
-    auto offset = position;
+    std::vector<iovec> iov(num, iovec{nullptr, 0});
 
-    for(auto &block : seq)
+    for(size_t i{0}; num > i; ++i)
     {
-        co_await loadBlock(file, block, offset);
-        offset += blockSize;
+        iov[i].iov_base = seq[i].data();
+        iov[i].iov_len = blockSize;
+    }
+
+    auto size{seqSize};
+    auto offset{position};
+
+    while(size)
+    {
+        const auto n = co_await file.dma_read(offset, iov);
+
+        //TRACE("n: ", n, ", size: ", size, ", iov.size: ", iov.size());
+
+        ENSURE(0 == n % blockSize);
+        ENSURE(size >= n);
+        size -= n;
+        offset += n;
+
+        if(size)
+        {
+            std::rotate(
+                std::begin(iov),
+                std::next(std::begin(iov), n / blockSize),
+                std::end(iov));
+            iov.resize(size / blockSize);
+        }
     }
     co_return seq;
 }
@@ -157,18 +182,46 @@ seastar::future<> storeBlock(
 }
 
 seastar::future<> storeBlockSeq(
-    seastar::file file, const BlockSeq &seq, const Position position)
+    seastar::file file,
+    BlockSeq &seq, const size_t blockSize, const Position position)
 {
     ENSURE(file);
     //TRACE_SCOPE("position: ", position, ", num: ", seq.size());
 
-    auto offset = position;
+    const auto num{seq.size()};
+    std::vector<iovec> iov(num, iovec{nullptr, 0});
 
-    for(const auto &i : seq)
+    for(size_t i{0}; num > i; ++i)
     {
-        co_await storeBlock(file, i, offset);
-        offset += i.size();
+        iov[i].iov_base = seq[i].data();
+        iov[i].iov_len = blockSize;
+        ENSURE(seq[i].size() == blockSize);
     }
+
+    auto size{num * blockSize};
+    auto offset{position};
+
+    while(size)
+    {
+        const auto n = co_await file.dma_write(offset, iov);
+
+        //TRACE("n: ", n, ", size: ", size, ", iov.size: ", iov.size());
+
+        ENSURE(0 == n % blockSize);
+        ENSURE(size >= n);
+        size -= n;
+        offset += n;
+
+        if(size)
+        {
+            std::rotate(
+                std::begin(iov),
+                std::next(std::begin(iov), n / blockSize),
+                std::end(iov));
+            iov.resize(size / blockSize);
+        }
+    }
+
     co_return;
 }
 
@@ -177,12 +230,13 @@ ChunkSeq split(Size fileSize, size_t maxChunkSize)
 {
     ChunkSeq seq;
     Position position = 0;
+    size_t n{0};
 
     while(fileSize > position)
     {
         const auto chunkSize = std::min(Size(maxChunkSize), fileSize - position);
 
-        seq.emplace_back(position, chunkSize);
+        seq.emplace_back(position, chunkSize, n++);
         position += chunkSize;
     }
 
@@ -196,10 +250,16 @@ seastar::future<> sortChunk(
     std::string outName,
     const Chunk &chunk, size_t blockSize)
 {
+    TRACE_SCOPE("chunk: ", chunk.no);
+
     auto seq = co_await loadBlockSeq(inFile, blockSize, chunk.size, chunk.position);
-    std::sort(std::begin(seq), std::end(seq));
+    {
+        //TRACE_SCOPE("sort: ", chunk.no);
+        std::sort(std::begin(seq), std::end(seq));
+    }
+
     auto outFile = co_await seastar::open_file_dma(outName, IOFlags::wo);
-    co_await storeBlockSeq(outFile, seq, chunk.position);
+    co_await storeBlockSeq(outFile, seq, blockSize, chunk.position);
     co_await outFile.flush();
     co_await outFile.close();
     co_return;
