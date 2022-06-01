@@ -353,10 +353,9 @@ seastar::future<> pushBlocks(
 
     auto seq = co_await loadBlockSeq(file, blockSize, preloadSize, chunk.position);
 
-    while(!seq.empty())
+    for(auto i = std::begin(seq); std::end(seq) != i; ++i)
     {
-        queue.push({std::move(seq.back()), &chunk});
-        seq.pop_back();
+        queue.push({std::move(*i), &chunk});
     }
     chunk.position += preloadSize;
     chunk.size -= preloadSize;
@@ -392,20 +391,20 @@ seastar::future<size_t> nWayMerge(
 
     while(!queue.empty())
     {
-        BlockSeq seq(num);
-        size_t n{0};
+        auto stop{false};
+        BlockSeq seq;
+        seq.reserve(num << 1);
 
-        while(!queue.empty() && num > n)
+        while(!queue.empty() && !stop)
         {
             auto &top = queue.top();
             ENSURE(top.chunk);
             ENSURE(top.chunk->preloadSize >= blockSize);
-            seq[n] = std::move(top.block);
+            seq.push_back(std::move(top.block));
             top.chunk->preloadSize -= blockSize;
-            ++n;
+            stop = 0 == top.chunk->preloadSize;
             queue.pop();
         }
-        seq.resize(n);
         co_await storeBlockSeq(file, seq, blockSize, dstOffset);
         dstOffset += seq.size() * blockSize;
         size += seq.size() * blockSize;
