@@ -370,12 +370,16 @@ seastar::future<size_t> nWayMerge(
     const size_t blockSize, const size_t maxSize,
     Position dstOffset)
 {
-    TRACE_SCOPE(
-        "range: ", range.length,
-        ", begin: ", range.begin->no, ", end: ", range.begin->no + range.length);
-
     const auto chunkSize{ALIGN_TO(maxSize / range.length, blockSize)};
     const auto num{chunkSize / blockSize};
+
+    TRACE_SCOPE(
+        "range: ", range.length,
+        ", begin: ", range.begin->no, ", end: ", range.begin->no + range.length,
+        ", maxSize: ", maxSize,
+        ", chunkSize: ", chunkSize,
+        ", num: ", num);
+
     BlockQueue queue;
     auto file = co_await seastar::open_file_dma(fileName, IOFlags::rw);
 
@@ -423,6 +427,8 @@ seastar::future<> truncateOutFile(
     auto file = co_await seastar::open_file_dma(name, IOFlags::rw);
     chunkSize = std::min(chunkSize, file.disk_write_max_length());
 
+    TRACE_SCOPE("name: ", name, ", to: ", inFileSize, ", bufSize: ", chunkSize);
+
     if(shift)
     {
         TRACE("shift data");
@@ -462,7 +468,7 @@ seastar::future<> merge(
     while(1 < seq.size())
     {
         /* max number of chunks we are able to process with chunkSize limit */
-        const auto maxChunkNum = std::max(size_t(2), std::min(maxBlockNum, seq.size()) / size_t(seastar::smp::count));
+        const auto maxChunkNum = std::min(maxBlockNum, seq.size());
         auto begin = std::begin(seq);
         auto end = std::cend(seq);
 
