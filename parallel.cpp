@@ -17,6 +17,7 @@
 
 #define ENSURE_ALIGNED(value, alignment) ENSURE(0 == ((value) & ((alignment) - 1)))
 //#define ENSURE_ALIGNED(value, alignment)
+#define ALIGN_TO(value, alignment) ((value) & (~((alignment) - 1)))
 
 using Block = std::vector<char>;
 using BlockSeq = std::vector<Block>;
@@ -31,6 +32,8 @@ struct Chunk
     Position position{0};
     size_t size{0};
     size_t no{0};
+    // for nWayMerge
+    size_t preloadSize{0};
 
     Chunk()
     {}
@@ -92,31 +95,6 @@ void dump(ChunkSeq::const_iterator begin, ChunkSeq::const_iterator end)
     TRACE(oss.str());
 }
 
-seastar::future<> loadBlock(
-    seastar::file file, Block &block, const Position position)
-{
-    ENSURE(file);
-    ENSURE(block.size());
-    ENSURE_ALIGNED(block.size(), file.disk_read_dma_alignment());
-    ENSURE_ALIGNED(uintptr_t(block.data()), file.disk_read_dma_alignment());
-    size_t size{0};
-
-    while(block.size() != size)
-    {
-        try
-        {
-            size +=
-                co_await
-                file.dma_read(position, block.data() + size, block.size() - size);
-        }
-        catch(...) {ENSURE(false);}
-    }
-
-    //TRACE("position: ", position);
-    //TRACE("\n", block);
-    co_return;
-}
-
 seastar::future<BlockSeq> loadBlockSeq(
     seastar::file file,
     const size_t blockSize, const size_t seqSize, const Position position)
@@ -160,25 +138,6 @@ seastar::future<BlockSeq> loadBlockSeq(
         }
     }
     co_return seq;
-}
-
-seastar::future<> storeBlock(
-    seastar::file file, const Block &block, Position position)
-{
-    ENSURE(file);
-    ENSURE(block.size());
-    ENSURE_ALIGNED(block.size(), file.disk_write_dma_alignment());
-    ENSURE_ALIGNED(uintptr_t(block.data()), file.disk_write_dma_alignment());
-
-    try
-    {
-        co_await file.dma_write(position, block.data(), block.size());
-    }
-    catch(...) {ENSURE(false);}
-
-    //TRACE("position: ", position, ", size: ", block.size());
-    //TRACE("\n", block);
-    co_return;
 }
 
 seastar::future<> storeBlockSeq(
@@ -288,11 +247,12 @@ seastar::future<> createOutFile(Size inFileSize, std::string name)
         co_await
             seastar::open_file_dma(
                 name, IOFlags::create | IOFlags::rw | IOFlags::truncate);
+    const auto blockSize{outFile.disk_write_dma_alignment()};
     /* pre-allocate output file, fill last block to get file size fixed
      * before concurrent writes */
-    Block blank(outFile.disk_write_dma_alignment(), '?');
+    BlockSeq blanks(1, Block(blockSize, '?'));
     co_await outFile.allocate(0, inFileSize << 1);
-    co_await storeBlock(outFile, blank, (inFileSize << 1) - blank.size());
+    co_await storeBlockSeq( outFile, blanks, blockSize, (inFileSize << 1) - blockSize);
     co_await outFile.flush();
     co_await outFile.close();
 }
@@ -377,17 +337,30 @@ struct Merger
     seastar::future<> stop() {return seastar::make_ready_future<>();}
 };
 
-seastar::future<> pushBlock(
-    seastar::file file, Chunk &chunk, size_t blockSize, BlockQueue &queue)
+seastar::future<> pushBlocks(
+    seastar::file file, Chunk &chunk,
+    size_t blockSize, size_t preloadSize,
+    BlockQueue &queue)
 {
+    //TRACE_SCOPE("chunk: ", chunk.no, ", preloadSize: ", preloadSize);
     if(0 == chunk.size) co_return;
 
-    Block block(blockSize);
+    preloadSize = std::min(chunk.size, preloadSize - chunk.preloadSize);
 
-    co_await loadBlock(file, block, chunk.position);
-    queue.push({std::move(block), &chunk});
-    chunk.position += blockSize;
-    chunk.size -= blockSize;
+    if(0 == preloadSize) co_return;
+
+    ENSURE(0 == preloadSize % blockSize);
+
+    auto seq = co_await loadBlockSeq(file, blockSize, preloadSize, chunk.position);
+
+    while(!seq.empty())
+    {
+        queue.push({std::move(seq.back()), &chunk});
+        seq.pop_back();
+    }
+    chunk.position += preloadSize;
+    chunk.size -= preloadSize;
+    chunk.preloadSize += preloadSize;
     co_return;
 }
 
@@ -397,25 +370,46 @@ seastar::future<size_t> nWayMerge(
     const size_t blockSize, const size_t maxSize,
     Position dstOffset)
 {
+    TRACE_SCOPE(
+        "range: ", range.length,
+        ", begin: ", range.begin->no, ", end: ", range.begin->no + range.length);
+
+    const auto chunkSize{ALIGN_TO(maxSize / range.length, blockSize)};
+    const auto num{chunkSize / blockSize};
     BlockQueue queue;
     auto file = co_await seastar::open_file_dma(fileName, IOFlags::rw);
 
     for(auto i = range.begin; range.end != i; ++i)
     {
-        co_await pushBlock(file, *i, blockSize, queue);
+        co_await pushBlocks(file, *i, blockSize, chunkSize, queue);
     }
 
     size_t size{0};
 
     while(!queue.empty())
     {
-         const auto &blockInfo = queue.top();
-         co_await storeBlock(file, blockInfo.block, dstOffset);
-         dstOffset += blockSize;
-         size += blockSize;
-         ENSURE(blockInfo.chunk);
-         co_await pushBlock(file, *blockInfo.chunk, blockSize, queue);
-         queue.pop();
+        BlockSeq seq(num);
+        size_t n{0};
+
+        while(!queue.empty() && num > n)
+        {
+            auto &top = queue.top();
+            ENSURE(top.chunk);
+            ENSURE(top.chunk->preloadSize >= blockSize);
+            seq[n] = std::move(top.block);
+            top.chunk->preloadSize -= blockSize;
+            ++n;
+            queue.pop();
+        }
+        seq.resize(n);
+        co_await storeBlockSeq(file, seq, blockSize, dstOffset);
+        dstOffset += seq.size() * blockSize;
+        size += seq.size() * blockSize;
+
+        for(auto i = range.begin; range.end != i; ++i)
+        {
+            co_await pushBlocks(file, *i, blockSize, chunkSize, queue);
+        }
     }
 
     co_await file.flush();
@@ -427,6 +421,7 @@ seastar::future<> truncateOutFile(
     Size inFileSize, std::string name, size_t chunkSize, bool shift)
 {
     auto file = co_await seastar::open_file_dma(name, IOFlags::rw);
+    chunkSize = std::min(chunkSize, file.disk_write_max_length());
 
     if(shift)
     {
