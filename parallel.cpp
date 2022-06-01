@@ -123,6 +123,7 @@ seastar::future<BlockSeq> loadBlockSeq(
 
         //TRACE("n: ", n, ", size: ", size, ", iov.size: ", iov.size());
 
+        ENSURE(0 != n);
         ENSURE(0 == n % blockSize);
         ENSURE(size >= n);
         size -= n;
@@ -166,6 +167,7 @@ seastar::future<> storeBlockSeq(
 
         //TRACE("n: ", n, ", size: ", size, ", iov.size: ", iov.size());
 
+        ENSURE(0 != n);
         ENSURE(0 == n % blockSize);
         ENSURE(size >= n);
         size -= n;
