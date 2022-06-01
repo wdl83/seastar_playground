@@ -346,49 +346,6 @@ seastar::future<> sortChunks(
     co_return;
 }
 
-seastar::future<> pushBlock(
-    seastar::file file, Chunk &chunk, size_t blockSize, BlockQueue &queue)
-{
-    if(0 == chunk.size) co_return;
-
-    Block block(blockSize);
-
-    co_await loadBlock(file, block, chunk.position);
-    queue.push({std::move(block), &chunk});
-    chunk.position += blockSize;
-    chunk.size -= blockSize;
-    co_return;
-}
-
-seastar::future<size_t> nWayMerge(
-    std::string fileName,
-    ChunkSeq::iterator begin, ChunkSeq::const_iterator end,
-    const size_t blockSize,
-    Position dstOffset)
-{
-    BlockQueue queue;
-    auto file = co_await seastar::open_file_dma(fileName, IOFlags::rw);
-
-    for(auto i = begin; end != i; ++i) co_await pushBlock(file, *i, blockSize, queue);
-
-    size_t size{0};
-
-    while(!queue.empty())
-    {
-         const auto &blockInfo = queue.top();
-         co_await storeBlock(file, blockInfo.block, dstOffset);
-         dstOffset += blockSize;
-         size += blockSize;
-         ENSURE(blockInfo.chunk);
-         co_await pushBlock(file, *blockInfo.chunk, blockSize, queue);
-         queue.pop();
-    }
-
-    co_await file.flush();
-    co_await file.close();
-    co_return size;
-}
-
 struct Merger
 {
     struct Range
@@ -419,6 +376,52 @@ struct Merger
     }
     seastar::future<> stop() {return seastar::make_ready_future<>();}
 };
+
+seastar::future<> pushBlock(
+    seastar::file file, Chunk &chunk, size_t blockSize, BlockQueue &queue)
+{
+    if(0 == chunk.size) co_return;
+
+    Block block(blockSize);
+
+    co_await loadBlock(file, block, chunk.position);
+    queue.push({std::move(block), &chunk});
+    chunk.position += blockSize;
+    chunk.size -= blockSize;
+    co_return;
+}
+
+seastar::future<size_t> nWayMerge(
+    std::string fileName,
+    Merger::Range range,
+    const size_t blockSize, const size_t maxSize,
+    Position dstOffset)
+{
+    BlockQueue queue;
+    auto file = co_await seastar::open_file_dma(fileName, IOFlags::rw);
+
+    for(auto i = range.begin; range.end != i; ++i)
+    {
+        co_await pushBlock(file, *i, blockSize, queue);
+    }
+
+    size_t size{0};
+
+    while(!queue.empty())
+    {
+         const auto &blockInfo = queue.top();
+         co_await storeBlock(file, blockInfo.block, dstOffset);
+         dstOffset += blockSize;
+         size += blockSize;
+         ENSURE(blockInfo.chunk);
+         co_await pushBlock(file, *blockInfo.chunk, blockSize, queue);
+         queue.pop();
+    }
+
+    co_await file.flush();
+    co_await file.close();
+    co_return size;
+}
 
 seastar::future<> truncateOutFile(
     Size inFileSize, std::string name, size_t chunkSize, bool shift)
@@ -489,7 +492,7 @@ seastar::future<> merge(
                 [](
                     Merger &merger,
                     std::string fileName,
-                    size_t stride, size_t blockSize)
+                    size_t stride, size_t blockSize, size_t chunkSize)
                 -> seastar::future<Merger::Range>
                 {
                     auto range = merger.ranges[seastar::this_shard_id()];
@@ -503,7 +506,7 @@ seastar::future<> merge(
 
                     const auto size =
                         co_await nWayMerge(
-                            fileName, range.begin, range.end, blockSize, offset);
+                            fileName, range, blockSize, chunkSize, offset);
 
                     range.begin->position = offset;
                     range.begin->size = size;
@@ -513,7 +516,8 @@ seastar::future<> merge(
             co_await
                 merger.map_reduce(
                     std::move(reduce), std::move(exec),
-                    std::string{fileName}, size_t{stride}, size_t{blockSize});
+                    std::string{fileName},
+                    size_t{stride}, size_t{blockSize}, size_t{chunkSize});
             co_await merger.stop();
         }
     }
