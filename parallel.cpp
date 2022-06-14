@@ -15,9 +15,9 @@
 
 #include "trace.h"
 
-#define ENSURE_ALIGNED(value, alignment) ENSURE(0 == ((value) & ((alignment) - 1)))
-//#define ENSURE_ALIGNED(value, alignment)
 #define ALIGN_TO(value, alignment) ((value) & (~((alignment) - 1)))
+#define UNALIGNMENT(value, alignment) ((value) & ((alignment) - 1))
+#define ENSURE_ALIGNED(value, alignment) ENSURE(0 == UNALIGNMENT(value, alignment))
 
 using Block = std::vector<char>;
 using BlockSeq = std::vector<Block>;
@@ -97,48 +97,61 @@ void dump(ChunkSeq::const_iterator begin, ChunkSeq::const_iterator end)
 
 seastar::future<BlockSeq> loadBlockSeq(
     seastar::file file,
-    const size_t blockSize, const size_t seqSize, const Position position)
+    const size_t blockSize, const size_t totalSize, const Position position)
 {
     ENSURE(file);
-    ENSURE(0 == seqSize % blockSize);
-    size_t num = seqSize / blockSize;
+    ENSURE_ALIGNED(totalSize, blockSize);
 
-    //TRACE_SCOPE("position: ", position, ", num: ", num, ", seqSize: ", seqSize);
-
+    const size_t maxStepSize{file.disk_read_max_length()};
+    const auto num = totalSize / blockSize;
     BlockSeq seq(num, Block(blockSize));
-    std::vector<iovec> iov(num, iovec{nullptr, 0});
-
-    for(size_t i{0}; num > i; ++i)
-    {
-        iov[i].iov_base = seq[i].data();
-        iov[i].iov_len = blockSize;
-    }
-
-    auto size{seqSize};
+    auto seqOffset{0};
     auto offset{position};
+    auto size{totalSize};
+
+    //TRACE_SCOPE("position: ", position, ", num: ", num, ", totalSize: ", totalSize);
 
     while(size)
     {
-        const auto n = co_await file.dma_read(offset, iov);
+        const auto stepSize = std::min(size, maxStepSize);
 
-        //TRACE("n: ", n, ", size: ", size, ", iov.size: ", iov.size());
+        try {
+            auto buf = co_await file.dma_read<char>(offset, stepSize);
+            auto begin  = buf.begin();
+            const auto end = buf.end();
+            ENSURE(buf.size());
 
-        ENSURE(0 != n);
-        ENSURE(0 == n % blockSize);
-        ENSURE(size >= n);
-        size -= n;
-        offset += n;
+            while(end != begin)
+            {
+                seq[seqOffset / blockSize][seqOffset % blockSize] = *begin;
+                ++seqOffset;
+                ++begin;
+            }
+        } catch(...) {ENSURE(false);}
 
-        if(size)
-        {
-            std::rotate(
-                std::begin(iov),
-                std::next(std::begin(iov), n / blockSize),
-                std::end(iov));
-            iov.resize(size / blockSize);
-        }
+        offset += stepSize;
+        size -= stepSize;
     }
     co_return seq;
+}
+
+size_t copy(
+    const BlockSeq &src, Block::iterator begin, Block::iterator end,
+    const size_t blockSize, const size_t position)
+{
+    const auto dstSize{end - begin};
+    const auto srcSize{src.size() * blockSize};
+    auto n = std::min(size_t(dstSize), size_t(srcSize) - position);
+    auto offset{position};
+
+    while(n)
+    {
+        *begin = src[offset / blockSize][offset % blockSize];
+       ++begin;
+        ++offset;
+        --n;
+    }
+    return offset - position;
 }
 
 seastar::future<> storeBlockSeq(
@@ -146,44 +159,78 @@ seastar::future<> storeBlockSeq(
     BlockSeq &seq, const size_t blockSize, const Position position)
 {
     ENSURE(file);
-    //TRACE_SCOPE("position: ", position, ", num: ", seq.size());
 
-    const auto num{seq.size()};
-    std::vector<iovec> iov(num, iovec{nullptr, 0});
+    const auto fSize = co_await file.size();
+    const size_t alignment{file.disk_write_dma_alignment()};
+    ENSURE(alignment == file.disk_read_dma_alignment());
+    const size_t maxStepSize{file.disk_write_max_length()};
+    const auto totalSize{seq.size() * blockSize};
+    Block buf(std::max(alignment, std::min(maxStepSize, ALIGN_TO(totalSize, alignment))));
+    auto seqOffset{0};
+    auto offset{position};
+    auto size{totalSize};
 
-    for(size_t i{0}; num > i; ++i)
+    const auto offsetUA{UNALIGNMENT(offset, alignment)};
+
+    //TRACE_SCOPE("position: ", position, ", num: ", seq.size(), ", totalSize: ", totalSize);
+
+    if(offsetUA)
     {
-        iov[i].iov_base = seq[i].data();
-        iov[i].iov_len = blockSize;
-        ENSURE(seq[i].size() == blockSize);
+        const auto begin{offset - offsetUA};
+        const auto end{std::min(begin + alignment, fSize)};
+
+        try {
+            const auto n = co_await file.dma_read(begin, buf.data(), end - begin);
+            ENSURE(n == end - begin);
+        } catch(...) {ENSURE(false);}
+
+        const auto stepSize{std::min(alignment - offsetUA, size)};
+        seqOffset +=
+            copy(
+                seq, buf.begin() + offsetUA, buf.begin() + offsetUA + stepSize,
+                blockSize, seqOffset);
+
+        try {
+            const auto n = co_await file.dma_write(begin, buf.data(), end - begin);
+            ENSURE(n == end - begin);
+        } catch(...) {ENSURE(false);}
+
+        offset += stepSize;
+        size -= stepSize;
     }
 
-    auto size{num * blockSize};
-    auto offset{position};
+    const auto sizeUA{UNALIGNMENT(size, alignment)};
 
     while(size)
     {
-        const auto n = co_await file.dma_write(offset, iov);
+        ENSURE_ALIGNED(offset, alignment);
+        ENSURE_ALIGNED(size - sizeUA, alignment);
 
-        //TRACE("n: ", n, ", size: ", size, ", iov.size: ", iov.size());
-
-        ENSURE(0 != n);
-        ENSURE(0 == n % blockSize);
-        ENSURE(size >= n);
-        size -= n;
-        offset += n;
-
-        if(size)
+        if(sizeUA && maxStepSize > size)
         {
-            std::rotate(
-                std::begin(iov),
-                std::next(std::begin(iov), n / blockSize),
-                std::end(iov));
-            iov.resize(size / blockSize);
+            const auto begin{offset + size - sizeUA};
+            const auto end{std::min(begin + alignment, fSize)};
+            try {
+               const auto n = co_await file.dma_read(begin, buf.data() + size - sizeUA, end - begin);
+                ENSURE(n == end - begin);
+            } catch(...) {ENSURE(false);}
+            const auto d{end - begin};
+            size += d - sizeUA;
         }
-    }
 
-    co_return;
+        const auto stepSize = std::min(size, maxStepSize);
+
+        seqOffset +=
+            copy(seq, std::begin(buf), std::begin(buf) + stepSize, blockSize, seqOffset);
+
+        try {
+            const auto n = co_await file.dma_write(offset, buf.data(), stepSize);
+            ENSURE(n == stepSize);
+        } catch(...) {ENSURE(false);}
+
+        offset += stepSize;
+        size -= stepSize;
+    }
 }
 
 /* split file into chunks */
@@ -219,7 +266,7 @@ seastar::future<> sortChunk(
         std::sort(std::begin(seq), std::end(seq));
     }
 
-    auto outFile = co_await seastar::open_file_dma(outName, IOFlags::wo);
+    auto outFile = co_await seastar::open_file_dma(outName, IOFlags::rw);
     co_await storeBlockSeq(outFile, seq, blockSize, chunk.position);
     co_await outFile.flush();
     co_await outFile.close();
@@ -245,18 +292,25 @@ struct Sorter
 
 seastar::future<> createOutFile(Size inFileSize, std::string name)
 {
-    auto outFile =
+    auto file =
         co_await
             seastar::open_file_dma(
                 name, IOFlags::create | IOFlags::rw | IOFlags::truncate);
-    const auto blockSize{outFile.disk_write_dma_alignment()};
+    const auto blockSize{file.disk_write_dma_alignment()};
+    const auto outFileSize = std::max(blockSize, inFileSize << 1);
+    const auto offset{outFileSize - blockSize};
     /* pre-allocate output file, fill last block to get file size fixed
      * before concurrent writes */
-    BlockSeq blanks(1, Block(blockSize, '?'));
-    co_await outFile.allocate(0, inFileSize << 1);
-    co_await storeBlockSeq( outFile, blanks, blockSize, (inFileSize << 1) - blockSize);
-    co_await outFile.flush();
-    co_await outFile.close();
+    Block blank(blockSize, '?');
+
+    try {
+        co_await file.allocate(0, outFileSize);
+        const auto n = co_await file.dma_write(offset, blank.data(), blockSize);
+        ENSURE(n == blockSize);
+    } catch(...) {ENSURE(false);}
+
+    co_await file.flush();
+    co_await file.close();
 }
 
 /* sort sequence of chunks */
@@ -439,8 +493,10 @@ seastar::future<> truncateOutFile(
         while(inFileSize != size)
         {
             const auto bufSize = std::min(Position(inFileSize - size), Position(buf.size()));
-            co_await file.dma_read(size + inFileSize, buf.data(), bufSize);
-            co_await file.dma_write(size, buf.data(), bufSize);
+            try {
+                co_await file.dma_read(size + inFileSize, buf.data(), bufSize);
+                co_await file.dma_write(size, buf.data(), bufSize);
+            } catch(...) {ENSURE(false);}
             size += bufSize;
         }
     }
@@ -555,9 +611,10 @@ int main(int argc, char* argv[])
             const auto outName = cfg["output"].as<std::string>();
             const auto blockSize = cfg["block"].as<size_t>();
             auto chunkSize = cfg["chunk"].as<size_t>();
-            const auto inFileSize = co_await seastar::file_size(inName);
-
-            TRACE("inFileSize: ", inFileSize, ", blockSize: ", blockSize, ", chunkSize: ", chunkSize);
+            auto inFile = co_await seastar::open_file_dma(inName, IOFlags::ro);
+            const auto inFileSize = co_await inFile.size();
+            const auto alignment{std::max(inFile.disk_read_dma_alignment(), inFile.disk_write_dma_alignment())};
+            co_await inFile.close();
 
             if(0 >= inFileSize)
                 co_return error("input file empty");
@@ -567,11 +624,15 @@ int main(int argc, char* argv[])
                 co_return error("input file not aligned to block boundary");
             if(chunkSize < (blockSize << 1))
                 co_return error("chunk size > 2x block size");
-            if(0 != chunkSize % blockSize)
+            if(alignment > chunkSize)
+                co_return error("chunkSize must be >= disk max(rd/wr) alignment");
+            if(0 != chunkSize % alignment)
             {
-                TRACE("realigned chunk size to block boundary: ", chunkSize);
-                chunkSize = (chunkSize / blockSize) * blockSize;
+                TRACE("realigned chunk size: ", chunkSize, ", to: ", alignment, " boundary");
+                chunkSize = std::max((chunkSize / alignment) * alignment, alignment);
             }
+
+            TRACE("inFileSize: ", inFileSize, ", blockSize: ", blockSize, ", chunkSize: ", chunkSize);
 
             auto seq = split(inFileSize, chunkSize);
             co_await sortChunks(inName, inFileSize, outName, seq, blockSize);
